@@ -1,0 +1,93 @@
+--information:座標公開_H v1.13 by HexBrowns（オートターゲット_H 用）
+--label:HexScript
+--check@include_center:中心を含める,1
+--value@PI:PI,{}
+--group:
+
+-- ターゲット側: 世界座標を公式 global へ公開（オートターゲット_H.cam2 が読む）
+-- キー: au2_at_h_<scene_id>:<layer> = "x,y,z,rx,ry,rz,frame"（最後に書いた値）
+--       au2_at_h_<scene_id>:<layer>@<frame mod 64> = 同じ形（v1.12。フレームごとの値。カメラは 1 つ前のフレームのものを引く）
+-- v1.13 からキーにシーンを入れる。レイヤー番号だけのキーは、シーンオブジェクトで別のシーンを描くと同じレイヤー番号どうしで
+-- 混ざる（実機 2026-09-27、検証 HUP-02）。obj.scene_id が無い本体（2.1.10 以前）は従来の au2_at_h_<layer>
+-- issue: AI/scripts/issues/20260927_coord_publish_global_key_collides_across_scenes.md
+-- frame はシーン基準の通しのフレーム番号（v1.11 から obj.originframe。v1.10 は frame_s + obj.frame）。カメラ側はこれで鮮度を見て、
+-- 古い値（このオブジェクトが終わった後に残ったもの）を使わない。v1.00 はオブジェクト基準の obj.frame を
+-- 書いていて、カメラ側も見ていなかった。issue: AI/scripts/オートターゲット_H/issues/20260725_autotarget_h_global_bridge.md
+
+local GLOBAL_PREFIX = "au2_at_h_"
+-- フレームごとの値を残すスロットの数（v1.12）。カメラは値の frame とスロットの番号を照合するので、
+-- 64 フレーム前の値を掴まない
+local SLOT_COUNT = 64
+
+-- シーン基準の通しのフレーム番号（v1.11）。本体 2.1.10 の obj.originframe（描いているフレーム）を使う。
+-- getvalue("frame_s") + obj.frame は、グループ制御に掛けたとき obj.frame がグループ制御の基準になり、
+-- 配下の開始の遅れの分だけずれる（実機 2026-09-25、検証 LAP-01。ルール au2-lua-pitfalls）。
+-- originframe が無い本体（2.1.9 以前）だけ従来の式に戻す
+local function scene_frame()
+  if obj.originframe ~= nil then
+    return obj.originframe
+  end
+  return (obj.getvalue("frame_s") or 0) + (obj.frame or 0)
+end
+
+local function is_enabled(value)
+  return value == true or value == 1
+end
+
+if type(PI) ~= "table" then
+  PI = {}
+end
+
+local use_center = is_enabled(include_center)
+if PI.include_center ~= nil then
+  use_center = is_enabled(PI.include_center)
+end
+
+local prefix = GLOBAL_PREFIX
+if type(PI.prefix) == "string" and PI.prefix ~= "" then
+  prefix = PI.prefix
+end
+
+local layer = obj.layer
+if PI.layer ~= nil then
+  layer = math.floor(tonumber(PI.layer) or layer)
+end
+
+local cx, cy, cz = 0, 0, 0
+if use_center then
+  cx = obj.cx or 0
+  cy = obj.cy or 0
+  cz = obj.cz or 0
+end
+
+local wx = (obj.x or 0) + (obj.ox or 0) + cx
+local wy = (obj.y or 0) + (obj.oy or 0) + cy
+local wz = (obj.z or 0) + (obj.oz or 0) + cz
+
+local brx = obj.getvalue("rx") or 0
+local bry = obj.getvalue("ry") or 0
+local brz = obj.getvalue("rz") or 0
+local rx = (obj.rx or 0) + brx
+local ry = (obj.ry or 0) + bry
+local rz = (obj.rz or 0) + brz
+
+local scene_part = ""
+if obj.scene_id ~= nil then
+  scene_part = tostring(obj.scene_id) .. ":"
+end
+local key = prefix .. scene_part .. tostring(layer)
+local frame = math.floor(scene_frame())
+local value = table.concat({
+  tostring(wx),
+  tostring(wy),
+  tostring(wz),
+  tostring(rx),
+  tostring(ry),
+  tostring(rz),
+  tostring(frame),
+}, ",")
+global[key] = value
+-- v1.12: フレームごとにも残す。プレビューで戻る・描き直すとき、カメラが「1 つ前のフレーム」の値を引けるように
+-- （カメラは公開側より先に走るので、読めるのは直前に描いたフレームの値。プレビューではそれが 1 つ前とは限らない。
+-- 実機 2026-09-25、検証 PRV）
+global[key .. "@" .. tostring(frame % SLOT_COUNT)] = value

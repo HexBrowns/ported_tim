@@ -1,0 +1,351 @@
+--information:オートターゲット_H v1.13 by HexBrowns（基準+相対追従 / PI）
+--label:HexScript
+--track@track_target_index:ターゲット,1,100,1,0.01
+--track@camera_distance:カメラ距離,0,20000,1024,0.1
+--track@easing:イーズ,0,100,20,0.1
+--check@check_smooth:なめらか,true
+--select@target_set_method:指定方法=0,絶対値=0,カメラからの相対値=1,前ターゲットからの相対値=2
+--select@coord_mode:座標モード=0,基準のみ=0,世界座標=1
+--group:ターゲット指定
+--value@targets:ターゲット一覧,{}
+--track@tar1:ターゲット1,0,1000,0,1
+--track@tar2:ターゲット2,0,1000,0,1
+--track@tar3:ターゲット3,0,1000,0,1
+--track@tar4:ターゲット4,0,1000,0,1
+--track@tar5:ターゲット5,0,1000,0,1
+--track@tar6:ターゲット6,0,1000,0,1
+--track@tar7:ターゲット7,0,1000,0,1
+--track@tar8:ターゲット8,0,1000,0,1
+--track@tar9:ターゲット9,0,1000,0,1
+--track@tar10:ターゲット10,0,1000,0,1
+--group:オプション
+--value@PI:PI,{}
+--group:
+
+local GLOBAL_PREFIX = "au2_at_h_"
+
+local function is_enabled(value)
+  return value == true or value == 1
+end
+
+local function as_bool(pi_val, ui_val)
+  if pi_val ~= nil then
+    return is_enabled(pi_val)
+  end
+  return is_enabled(ui_val)
+end
+
+local function value_type(v)
+  local s = tostring(v)
+  if s == v then
+    return "string"
+  end
+  if s == "nil" then
+    return "nil"
+  end
+  if s == "true" or s == "false" then
+    return "boolean"
+  end
+  if string.find(s, "table:") then
+    return "table"
+  end
+  if string.find(s, "function:") then
+    return "function"
+  end
+  if string.find(s, "userdata:") then
+    return "userdata"
+  end
+  return "number"
+end
+
+-- PI 上書き
+if type(PI) ~= "table" then
+  PI = {}
+end
+
+track_target_index = tonumber(PI.track_target_index) or track_target_index
+camera_distance = tonumber(PI.camera_distance) or camera_distance
+easing = tonumber(PI.easing) or easing
+check_smooth = as_bool(PI.check_smooth, check_smooth)
+target_set_method = math.floor(tonumber(PI.target_set_method) or target_set_method)
+coord_mode = math.floor(tonumber(PI.coord_mode) or coord_mode)
+
+if type(PI.targets) == "table" and #PI.targets > 0 then
+  targets = PI.targets
+end
+
+local tar_vals = { tar1, tar2, tar3, tar4, tar5, tar6, tar7, tar8, tar9, tar10 }
+for i = 1, 10 do
+  local key = "tar" .. i
+  if PI[key] ~= nil then
+    tar_vals[i] = tonumber(PI[key]) or PI[key]
+  end
+end
+
+-- シーン基準の通しのフレーム番号（v1.11）。本体 2.1.10 の obj.originframe（描いているフレーム）を使う。
+-- getvalue("frame_s") + obj.frame は、グループ制御に掛けたとき obj.frame がグループ制御の基準になり、
+-- 配下の開始の遅れの分だけずれる（実機 2026-09-25、検証 LAP-01。ルール au2-lua-pitfalls）。
+-- originframe が無い本体（2.1.9 以前）だけ従来の式に戻す
+local function scene_frame()
+  if obj.originframe ~= nil then
+    return obj.originframe
+  end
+  return (obj.getvalue("frame_s") or 0) + (obj.frame or 0)
+end
+
+-- 座標公開_H v1.11 が同じ関数で書く（v1.10 の公開側とも、グループ制御に掛けていなければ同じ値になる）
+local now_frame = scene_frame()
+
+-- 座標公開_H の値は「今のフレームの 1 つ前」に書かれたものだけを使う（v1.12）。
+-- カメラは同じフレームの公開側より先に走る（実機 2026-09-23、検証 ATG）ので、出力では毎フレーム 1 つ前の値になる。
+-- プレビューでは直前に描いたフレームが 1 つ前とは限らない（戻る・描き直す・飛ぶ。実機 2026-09-25、検証 PRV）ので、
+-- 座標公開_H v1.12 がフレームごとに残した値（スロット）から 1 つ前のものを引く。これでプレビューでも出力と同じ絵になる。
+-- v1.11 は「同じか 1 つ前」を 1 本のキーで見ていたので、← キーやシークで値を捨てて基準へ飛び、描き直すと遅れが消えた。
+-- global は描画をまたいで残るので、スロットは「公開側がまだ走っているか」を確かめてから使う（下の read_published）。
+local SLOT_COUNT = 64
+
+-- 座標公開_H v1.13 と同じく、キーにシーンを入れる（"<scene_id>:"）。レイヤー番号だけのキーは、シーンオブジェクトで
+-- 別のシーンを描くと同じレイヤー番号どうしで混ざる（実機 2026-09-27、検証 HUP-02）。カメラ制御が狙えるのは自分のシーンの
+-- レイヤーだけなので、自分のシーンの値だけを読めばよい。obj.scene_id が無い本体（2.1.10 以前）は従来のキー
+local scene_part = ""
+if obj.scene_id ~= nil then
+  scene_part = tostring(obj.scene_id) .. ":"
+end
+
+-- このカメラが直前に描いたフレーム。公開側が消された・終わった後に、スロットに残った古い値を使わないために見る
+local cam_marker_key = GLOBAL_PREFIX .. "cam" .. scene_part .. tostring(obj.layer)
+local cam_prev_frame = tonumber(global[cam_marker_key])
+global[cam_marker_key] = tostring(now_frame)
+
+local function split_global(s)
+  if type(s) ~= "string" or s == "" then
+    return nil
+  end
+  local parts = {}
+  for part in string.gmatch(s, "[^,]+") do
+    parts[#parts + 1] = tonumber(part)
+  end
+  if #parts < 7 or parts[7] == nil then
+    return nil
+  end
+  return parts
+end
+
+local function parse_global_pos(s, want_frame)
+  local parts = split_global(s)
+  if parts == nil or parts[7] ~= want_frame then
+    return nil
+  end
+  return {
+    x = parts[1],
+    y = parts[2],
+    z = parts[3],
+    rx = parts[4] or 0,
+    ry = parts[5] or 0,
+    rz = parts[6] or 0,
+  }
+end
+
+-- 座標公開_H が 1 つ前のフレームに書いた値。無ければ nil（基準を見る）
+local function read_published(layer)
+  local key = GLOBAL_PREFIX .. scene_part .. layer
+  local latest = global[key]
+  local want = now_frame - 1
+  -- 直前に 1 つ前のフレームを描いた（出力・再生・→ キー）。座標公開_H v1.11 以前もここで読める
+  local pos = parse_global_pos(latest, want)
+  if pos then
+    return pos
+  end
+  -- 最後の書き込みが、このカメラの直前の描画（か今の描画）でなければ、公開側はもう走っていない
+  local parts = split_global(latest)
+  if parts == nil or (parts[7] ~= cam_prev_frame and parts[7] ~= now_frame) then
+    return nil
+  end
+  return parse_global_pos(global[key .. "@" .. tostring(want % SLOT_COUNT)], want)
+end
+
+local function get_pi_world(layer)
+  local world = PI.world
+  if type(world) ~= "table" then
+    return nil
+  end
+  local w = world[layer] or world[tostring(layer)]
+  if type(w) ~= "table" then
+    return nil
+  end
+  local x = tonumber(w.x)
+  local y = tonumber(w.y)
+  local z = tonumber(w.z)
+  if x == nil or y == nil or z == nil then
+    return nil
+  end
+  return {
+    x = x,
+    y = y,
+    z = z,
+    rx = tonumber(w.rx) or 0,
+    ry = tonumber(w.ry) or 0,
+    rz = tonumber(w.rz) or 0,
+  }
+end
+
+local function get_base_pos(layer)
+  local x = obj.getvalue("layer" .. layer .. ".x")
+  if x == nil then
+    return nil
+  end
+  return {
+    x = x,
+    y = obj.getvalue("layer" .. layer .. ".y") or 0,
+    z = obj.getvalue("layer" .. layer .. ".z") or 0,
+    rx = obj.getvalue("layer" .. layer .. ".rx") or 0,
+    ry = obj.getvalue("layer" .. layer .. ".ry") or 0,
+    rz = obj.getvalue("layer" .. layer .. ".rz") or 0,
+  }
+end
+
+local function get_target_pos(layer)
+  local use_world = (coord_mode == 1)
+  if use_world then
+    local from_pi = get_pi_world(layer)
+    if from_pi then
+      return from_pi
+    end
+    local from_global = read_published(layer)
+    if from_global then
+      return from_global
+    end
+  end
+  return get_base_pos(layer)
+end
+
+local target = {}
+local tarN
+if type(targets) == "table" and #targets > 0 then
+  target = targets
+  tarN = #target
+else
+  target = tar_vals
+  tarN = 10
+  for i = 1, 10 do
+    if value_type(target[i]) ~= "number" then
+      tarN = i - 1
+      break
+    end
+  end
+end
+
+if tarN < 1 then
+  return
+end
+
+local tn = track_target_index
+local CL = camera_distance
+local ez = easing / 10
+if tn > tarN then
+  tn = tarN
+end
+
+if target_set_method == 1 then
+  for i = 1, tarN do
+    target[i] = target[i] + obj.layer
+  end
+elseif target_set_method == 2 then
+  local sum = obj.layer
+  for i = 1, tarN do
+    sum = sum + target[i]
+    target[i] = sum
+  end
+end
+
+local tarData = {}
+for i = 1, tarN do
+  target[i] = math.floor(target[i])
+  if target[i] < 1 then
+    target[i] = 1
+  end
+  tarData[i] = get_target_pos(target[i])
+end
+
+for i = tarN, 1, -1 do
+  if tarData[i] == nil or tarData[i].x == nil then
+    table.remove(tarData, i)
+    tarN = tarN - 1
+  end
+end
+
+if tarN < 1 then
+  return
+end
+
+local tn1 = math.floor(tn)
+local tn2 = tn1 + 1
+tn = tn - tn1
+
+if ez ~= 0 then
+  tn = math.exp(ez * (2 * tn - 1))
+  local keisu = (math.exp(ez) + 1) / (math.exp(ez) - 1)
+  tn = (1 + keisu * (tn - 1) / (tn + 1)) / 2
+end
+local tni = 1 - tn
+if tn2 > tarN then
+  tn2 = tarN
+end
+
+local cam = obj.getoption("camera_param")
+local crxd, cryd, crzd
+
+if not is_enabled(check_smooth) then
+  cam.tx = tni * tarData[tn1].x + tn * tarData[tn2].x
+  cam.ty = tni * tarData[tn1].y + tn * tarData[tn2].y
+  cam.tz = tni * tarData[tn1].z + tn * tarData[tn2].z
+
+  crxd = tni * tarData[tn1].rx + tn * tarData[tn2].rx
+  cryd = tni * tarData[tn1].ry + tn * tarData[tn2].ry
+  crzd = tni * tarData[tn1].rz + tn * tarData[tn2].rz
+else
+  local tn0 = tn1 - 1
+  if tn0 < 1 then
+    tn0 = 1
+  end
+  local tn3 = tn2 + 1
+  if tn3 > tarN then
+    tn3 = tarN
+  end
+
+  local x0, y0, z0 = tarData[tn0].x, tarData[tn0].y, tarData[tn0].z
+  local x1, y1, z1 = tarData[tn1].x, tarData[tn1].y, tarData[tn1].z
+  local x2, y2, z2 = tarData[tn2].x, tarData[tn2].y, tarData[tn2].z
+  local x3, y3, z3 = tarData[tn3].x, tarData[tn3].y, tarData[tn3].z
+  cam.tx, cam.ty, cam.tz = obj.interpolation(tn, x0, y0, z0, x1, y1, z1, x2, y2, z2, x3, y3, z3)
+
+  x0, y0, z0 = tarData[tn0].rx, tarData[tn0].ry, tarData[tn0].rz
+  x1, y1, z1 = tarData[tn1].rx, tarData[tn1].ry, tarData[tn1].rz
+  x2, y2, z2 = tarData[tn2].rx, tarData[tn2].ry, tarData[tn2].rz
+  x3, y3, z3 = tarData[tn3].rx, tarData[tn3].ry, tarData[tn3].rz
+  crxd, cryd, crzd = obj.interpolation(tn, x0, y0, z0, x1, y1, z1, x2, y2, z2, x3, y3, z3)
+end
+
+local sx = math.sin(crxd * math.pi / 180)
+local cx = math.cos(crxd * math.pi / 180)
+local sy = math.sin(cryd * math.pi / 180)
+local cy = math.cos(cryd * math.pi / 180)
+local sz = math.sin(crzd * math.pi / 180)
+local cz = math.cos(crzd * math.pi / 180)
+
+local cax = -sy
+local cay = sx * cy
+local caz = -cx * cy
+
+local ux = cy * sz
+local uy = -cx * cz + (sx * sz) * sy
+local uz = -sx * cz - (cx * sz) * sy
+
+cam.x = cam.tx + cax * CL
+cam.y = cam.ty + cay * CL
+cam.z = cam.tz + caz * CL
+cam.ux = ux
+cam.uy = uy
+cam.uz = uz
+
+obj.setoption("camera_param", cam)

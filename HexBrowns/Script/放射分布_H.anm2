@@ -1,0 +1,105 @@
+--information:放射分布_H v1.00 by HexBrowns
+--label:HexScript
+--track@track_speed:速度,0,10000,30,0.1
+--track@track_radial_amount:放射度,0,100,100,0.1
+--track@track_radius:初期半径,0,10000,100,0.1
+--track@track_count:個数,1,10000,30,1
+--track@track_speed_error:速度誤差,0,10,1.5,0.01
+--check@check_even_radius_distribution:均等動径配置,0
+--check@check_even_angle_distribution:均等角配置,0
+--track@track_initial_rotation_error:初期回転角誤差,0,360,360,0.1
+--track@track_max_rotation_speed:最大回転速度,0,1000,45,0.1
+--track@track_fade_duration:消滅時間,0,10,0.3,0.01
+--track@track_fade_speed:消滅速度,0,100,10,0.1
+--track@track_center_x:中心X,-2000,2000,0,0.1
+--track@track_center_y:中心Y,-2000,2000,0,0.1
+--track@track_random_seed:乱数シード,0,1000000,200,1
+
+--[[
+@tim.anm2.anm2 の @放射分布（第三者作）を軽くした版。原作は残してある。設定項目は原作と同じ。
+
+原作は毎フレーム画面サイズ（1920x1080）の仮想バッファを確保して粒を描き、それをオブジェクトへ複写する。
+結果のオブジェクトも常に画面サイズになるので、後ろに足したフィルタ効果（グロー等）が画面全体に掛かる。
+
+本版で変えたこと
+  ・先に全粒の位置を計算し、粒が収まる大きさ（原点を中心に対称、偶数ピクセル、画面サイズが上限）の
+    仮想バッファだけを確保する。粒の位置・回転・透明度・描く順は原作と同じ
+  ・全粒が透明になったフレームでは何も描かない
+
+バッファの余白は、画像の対角線の半分 x 放射度 x 拡大率 x (1+|縦横比|) に中心のずれを足した保守的な値。
+検証器: AI/scripts/放射分布_H/verify_radial.py
+]]
+
+local obj, math = obj, math
+
+local speed = track_speed
+local radial_amount = track_radial_amount * 0.01
+local initial_radius = track_radius
+local particle_count = math.floor(track_count)
+local speed_error = math.max(track_speed_error or 0, 0)
+local is_even_radius_distribution = check_even_radius_distribution == true or check_even_radius_distribution == 1
+local is_even_angle_distribution = check_even_angle_distribution == true or check_even_angle_distribution == 1
+local initial_rotation_error = math.max(track_initial_rotation_error or 360, 0) * 10
+local max_rotation_speed = track_max_rotation_speed or 45
+local fade_duration = math.max(track_fade_duration or 0, 0)
+local fade_speed = math.max(track_fade_speed or 0, 0)
+local center_x = track_center_x or 0
+local center_y = track_center_y or 0
+local random_seed = math.floor(track_random_seed or 200)
+local sector_count = math.min(particle_count, 8)
+local radius_distribution_min = is_even_radius_distribution and 1000 or 0
+
+local elapsed_time = obj.time
+local total_time = obj.totaltime
+
+local px, py, prot, palpha = {}, {}, {}, {}
+local max_x, max_y = 0, 0
+local any_visible = false
+
+for i = 1, particle_count do
+  local radius_random_ratio = obj.rand(radius_distribution_min, 1000, i, 1000 + random_seed) * 0.001
+  local particle_radius = initial_radius * math.sqrt(radius_random_ratio)
+    + speed * (1 + speed_error * obj.rand(0, 1000, i, 2000 + random_seed) * 0.001) * elapsed_time
+  local sector_index = i % sector_count
+  local particle_angle
+  if is_even_angle_distribution then
+    particle_angle = 2 * math.pi * (i - 1) / particle_count
+  else
+    particle_angle = 2 * math.pi
+      * obj.rand(sector_index / sector_count * 1000, (sector_index + 1) / sector_count * 1000, i, 3000 + random_seed)
+      * 0.001
+  end
+  particle_radius = particle_radius * radial_amount
+  local x = particle_radius * math.cos(particle_angle) + center_x
+  local y = particle_radius * math.sin(particle_angle) + center_y
+  local rot = obj.rand(0, initial_rotation_error, i, 4000 + random_seed) * 0.1
+    + max_rotation_speed * obj.rand(-1000, 1000, i, 5000 + random_seed) * 0.001 * elapsed_time
+  local a = 1
+  local fade_start_time = total_time - i / particle_count * fade_duration
+  if elapsed_time > fade_start_time then
+    a = math.max(0, 1 - fade_speed * (elapsed_time - fade_start_time))
+  end
+  px[i], py[i], prot[i], palpha[i] = x, y, rot, a
+  if a > 0 then any_visible = true end
+  if math.abs(x) > max_x then max_x = math.abs(x) end
+  if math.abs(y) > max_y then max_y = math.abs(y) end
+end
+
+if not any_visible then
+  obj.setoption("draw_state", true)
+  return
+end
+
+-- 粒 1 個が中心から届く距離（回転しても収まるよう対角線の半分で取る）
+local margin = math.sqrt(obj.w * obj.w + obj.h * obj.h) / 2
+  * radial_amount * math.max(1, obj.zoom or 1) * (1 + math.abs(obj.aspect or 0))
+  + math.abs(obj.cx or 0) + math.abs(obj.cy or 0) + 2
+local buf_w = math.min(obj.screen_w, 2 * math.ceil(max_x + margin))
+local buf_h = math.min(obj.screen_h, 2 * math.ceil(max_y + margin))
+
+obj.setoption("drawtarget", "tempbuffer", buf_w, buf_h)
+for i = 1, particle_count do
+  obj.draw(px[i], py[i], 0, radial_amount, palpha[i], 0, 0, prot[i])
+end
+
+obj.copybuffer("object", "tempbuffer")
